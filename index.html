@@ -116,7 +116,7 @@
 
   // Helpers
   //const fmt = x => (Math.abs(x)>=100 || Math.abs(x)<0.01) ? x.toExponential(2) : x.toFixed(3);
-  const fmt = x => Math.abs(x)<0.01 ? 0.00 : x.toFixed(3);
+  const fmt = x => x.toFixed(3);
 
   const getProp = (o,k) => o ? (o[k] ?? o[k.toLowerCase()] ?? o[k.toUpperCase()]) : undefined;
   const clamp01 = t => Math.max(0, Math.min(1, t));
