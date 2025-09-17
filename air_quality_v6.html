@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Air Quality Map</title>
+
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E">
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- MarkerCluster -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <script src="https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+
+  <!-- D3 -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+
+    .marker-cluster div { background: transparent !important; border: none !important; box-shadow:none !important; width:0; height:0; }
+
+    .dot, .cluster-dot {
+      display:inline-block;
+      border-radius:50%;
+      /* No border, no glow; pure semi-transparent fill set inline */
+    }
+
+    .pollutant-control, .legend, .leaflet-control-layers {
+      background: rgba(255,255,255,0.92);
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,0.2);
+    }
+    .pollutant-control { padding: 10px 12px; font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    .pollutant-control h4 { margin: 0 0 6px 0; font-size: 14px; font-weight: 700; }
+    .pollutant-control label { display:block; margin: 4px 0; cursor: pointer; }
+    .pollutant-control.disabled { opacity: 0.6; }
+
+    .legend { padding: 10px 12px; font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; width: 360px; }
+    .legend-title { font-weight: 700; margin-bottom: 6px; }
+    .legend-bar { height: 12px; border-radius: 6px; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.12); margin-bottom: 6px; }
+    .legend-ticks { display:flex; justify-content: space-between; font-size:11px; color:#333; }
+    .legend-note { color:#555; margin-top:4px; font-size:11px; }
+
+    .leaflet-control-layers { padding: 6px; }
+
+    .message {
+      position:absolute; left:50%; top:12px; transform:translateX(-50%);
+      background: rgba(0,0,0,0.7); color:#fff; padding:6px 10px; border-radius:6px;
+      font: 12px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      z-index: 800; display:none;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="msg" class="message"></div>
+
+  <script>
+  // ---------------- Config ----------------
+  const GEOJSON_URL = 'pollutants_spatial.geojson';
+  const POLLUTANTS = ['CO','NOX','VOC','PM','CO2'];
+  const ramp = d3.interpolateRgbBasis(['#ffffe5', '#ffe082', '#ff8f00', '#b71c1c']); // white→yellow→orange→red
+  const QUANT_LOW = 0.01, QUANT_HIGH = 0.99; // robust range for color domain
+  const ALPHA = 0.65;               // semi-transparency for points/clusters
+  const PT_MIN = 6,  PT_MAX = 22;   // px
+  const CL_MIN = 10, CL_MAX = 28;   // px
+  const CLUSTER_AGG_Q = 0.90;       // use 90th percentile within a cluster (emphasize highs)
+
+  // --------------- Map --------------------
+  const light = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_nolabels/{z}/{x}/{y}{r}.png',
+    { attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 20 });
+  const dark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png',
+    { attribution: '&copy; OpenStreetMap &copy; CARTO', maxZoom: 20 });
+
+  const map = L.map('map', { center: [25.2048, 55.2708], zoom: 13, layers: [dark] });
+  L.control.layers({ 'Light': light, 'Dark': dark }, null, { collapsed: false, position: 'topright' }).addTo(map);
+
+  function flash(msg, t=1600){ const el=document.getElementById('msg'); el.textContent=msg; el.style.display='block'; clearTimeout(flash._t); flash._t=setTimeout(()=>{el.style.display='none';},t); }
+
+  // Pollutant radio control
+  const PollutantControl = L.Control.extend({
+    options: { position: 'topright' },
+    onAdd: function () {
+      const div = L.DomUtil.create('div', 'pollutant-control disabled');
+      div.innerHTML = '<h4>Air quality indicator</h4>' +
+        POLLUTANTS.map(p => `<label><input type="radio" name="pollutant" value="${p}"> ${p}</label>`).join('');
+      L.DomEvent.disableClickPropagation(div);
+      return div;
+    }
+  });
+  new PollutantControl().addTo(map);
+
+  // Legend
+  const Legend = L.Control.extend({
+    options: { position: 'topleft' },
+    onAdd: function(){
+      const div = L.DomUtil.create('div', 'legend');
+      div.innerHTML = `
+        <div class="legend-title">Pollutant concentration (p01–p99 scale)</div>
+        <div id="legend-bar" class="legend-bar"></div>
+        <div class="legend-ticks"><span id="legend-min">—</span><span id="legend-mid">—</span><span id="legend-max">—</span></div>
+        <div class="legend-note">Clusters colored by 90th percentile to emphasize hotspots.</div>`;
+      return div;
+    }
+  });
+  new Legend().addTo(map);
+  (function setLegendGradient(){
+    const bar=document.getElementById('legend-bar');
+    const stops=[]; for(let i=0;i<=10;i++){ const t=i/10; stops.push(ramp(t)+' '+(t*100).toFixed(0)+'%'); }
+    bar.style.background = 'linear-gradient(to right,'+stops.join(',')+')';
+  })();
+
+  // Helpers
+  const fmt = x => (Math.abs(x)>=100 || Math.abs(x)<0.01) ? x.toExponential(2) : x.toFixed(3);
+  const getProp = (o,k) => o ? (o[k] ?? o[k.toLowerCase()] ?? o[k.toUpperCase()]) : undefined;
+  const clamp01 = t => Math.max(0, Math.min(1, t));
+  const colorFor = (v, lo, hi) => ramp(clamp01((v-lo)/(hi-lo)));
+  const sizeFor = (v, lo, hi, minPx, maxPx) => { const t = clamp01((v-lo)/(hi-lo)); return minPx + (maxPx - minPx) * Math.sqrt(t); };
+  const rgba = (hex, a) => { const c = d3.color(hex).rgb(); return `rgba(${c.r},${c.g},${c.b},${a})`; };
+
+  let data=null, active=null, layer=null, statsByPollutant={};
+
+  // Load and precompute
+  fetch(GEOJSON_URL).then(r=>r.json()).then(gj => {
+    data = gj;
+    try { const b=L.geoJSON(gj).getBounds(); if (b.isValid()) map.fitBounds(b); } catch(e){}
+
+    for (const name of POLLUTANTS) {
+      const vals = [];
+      for (const f of data.features) {
+        const v = Number(getProp(f.properties, name));
+        if (Number.isFinite(v)) vals.push(v);
+      }
+      const sorted = vals.filter(v => v>0 && Number.isFinite(v)).sort((a,b)=>a-b);
+      let lo=0, hi=1;
+      if (sorted.length>=5){ lo=d3.quantileSorted(sorted, QUANT_LOW); hi=d3.quantileSorted(sorted, QUANT_HIGH); }
+      else if (vals.length){ lo=Math.min(...vals); hi=Math.max(...vals); }
+      if (!(hi>lo)) hi = lo + 1e-9;
+      statsByPollutant[name] = {lo,hi,count:vals.length};
+    }
+
+    document.querySelector('.pollutant-control').classList.remove('disabled');
+    document.querySelectorAll('input[name="pollutant"]').forEach(inp => {
+      inp.addEventListener('change', () => { active = inp.value; render(); });
+    });
+  }).catch(err => { console.error(err); flash('Failed to load GeoJSON. Serve with a local server.'); });
+
+  function clusterQuantile(children, q){
+    const vals=[];
+    for(const m of children){ const v=m.options.value; if(Number.isFinite(v)) vals.push(v); }
+    if (!vals.length) return NaN;
+    vals.sort((a,b)=>a-b);
+    return d3.quantileSorted(vals, q);
+  }
+
+  function render(){
+    if (!data || !active) return;
+    if (layer) { map.removeLayer(layer); layer=null; }
+
+    const {lo, hi} = statsByPollutant[active] || {lo:0, hi:1};
+    document.getElementById('legend-min').textContent=fmt(lo);
+    document.getElementById('legend-mid').textContent=fmt((lo+hi)/2);
+    document.getElementById('legend-max').textContent=fmt(hi);
+
+    layer = L.markerClusterGroup({
+      // Smaller cluster radius to reduce spacing, producing denser dots
+      maxClusterRadius: function(zoom){ return Math.max(6, 36 - (zoom * 2)); },
+      spiderfyOnMaxZoom: true,
+      showCoverageOnHover: false,
+      iconCreateFunction: function(cluster){
+        const qv = clusterQuantile(cluster.getAllChildMarkers(), CLUSTER_AGG_Q);
+        const hex = colorFor(qv, lo, hi);
+        const d = sizeFor(qv, lo, hi, CL_MIN, CL_MAX);
+        const fill = rgba(hex, ALPHA);
+        return L.divIcon({
+          html:`<span class="cluster-dot" style="background:${fill}; width:${d}px; height:${d}px;"></span>`,
+          className:'avg-cluster', iconSize:[d,d]
+        });
+      }
+    });
+
+    const markers=[];
+    for (const f of data.features){
+      if (!f.geometry || f.geometry.type!=='Point') continue;
+      const [lng, lat] = f.geometry.coordinates;
+      const v = Number(getProp(f.properties, active));
+      if (!Number.isFinite(v)) continue;
+      const hex = colorFor(v, lo, hi);
+      const d = sizeFor(v, lo, hi, PT_MIN, PT_MAX);
+      const fill = rgba(hex, ALPHA);
+      const icon = L.divIcon({ html:`<span class="dot" style="background:${fill}; width:${d}px; height:${d}px;"></span>`, className:'plain-dot', iconSize:[d,d] });
+      const m = L.marker([lat,lng], {icon, value:v, zIndexOffset: Math.round(d)}).bindTooltip(`${active}: ${fmt(v)}`, {direction:'top', offset:[0,-2]});
+      markers.push(m);
+    }
+    layer.addLayers(markers);
+    map.addLayer(layer);
+    flash(`Rendered ${markers.length.toLocaleString()} points for ${active}`);
+  }
+  </script>
+</body>
+</html>
